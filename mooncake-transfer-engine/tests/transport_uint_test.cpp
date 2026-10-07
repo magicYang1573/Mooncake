@@ -197,6 +197,65 @@ class TransferEngineImplTestPeer {
     }
 };
 
+TEST(ScatterPlannerTest, SelectsGatherForManySmallFragmentsAcrossLinks) {
+    constexpr size_t kFragments = 98304;
+    constexpr uint64_t kBytes = kFragments * 264ULL;
+    for (const double link_gbps : {25.0, 100.0, 200.0}) {
+        for (size_t queue_depth : {64UL, 1024UL}) {
+            const TransferEngineImpl::ScatterTransportProfile profile{
+                .link_bytes_per_second = link_gbps * 1e9 / 8.0,
+                .queue_depth = queue_depth,
+                .pipeline_width = 4,
+            };
+            const auto plan = TransferEngineImpl::planScatter(
+                kFragments, kFragments, kBytes, profile);
+            EXPECT_TRUE(plan.gather)
+                << "link=" << link_gbps << "Gbps queue_depth=" << queue_depth;
+            EXPECT_LE(plan.chunk_bytes, 1ULL << 20)
+                << "link=" << link_gbps << "Gbps queue_depth=" << queue_depth;
+            EXPECT_GT((kBytes + plan.chunk_bytes - 1) / plan.chunk_bytes,
+                      plan.pipeline_depth)
+                << "link=" << link_gbps << "Gbps queue_depth=" << queue_depth;
+        }
+    }
+}
+
+TEST(ScatterPlannerTest, KeepsFewOrLargeFragmentsDirect) {
+    const TransferEngineImpl::ScatterTransportProfile profile{
+        .link_bytes_per_second = 100.0e9 / 8.0,
+        .queue_depth = 256,
+        .pipeline_width = 2,
+    };
+    EXPECT_FALSE(
+        TransferEngineImpl::planScatter(4, 4, 4 * 264, profile).gather);
+    EXPECT_FALSE(
+        TransferEngineImpl::planScatter(64, 64, 64ULL * 512 * 1024, profile)
+            .gather);
+    EXPECT_GT(TransferEngineImpl::scatterSmallFragmentLimit(profile), 264U);
+    EXPECT_LT(TransferEngineImpl::scatterSmallFragmentLimit(profile),
+              32ULL * 1024);
+}
+
+TEST(ScatterPlannerTest, SeparatesMediumAndSmallFragmentLoads) {
+    const TransferEngineImpl::ScatterTransportProfile profile{
+        .link_bytes_per_second = 100.0e9 / 8.0,
+        .queue_depth = 512,
+        .pipeline_width = 2,
+    };
+    EXPECT_FALSE(
+        TransferEngineImpl::planScatter(4096, 4096, 4096ULL * 4096, profile)
+            .gather);
+    EXPECT_TRUE(
+        TransferEngineImpl::planScatter(16384, 16384, 16384ULL * 1024, profile)
+            .gather);
+    const auto engram =
+        TransferEngineImpl::planScatter(98304, 98304, 98304ULL * 264, profile);
+    EXPECT_TRUE(engram.gather);
+    EXPECT_EQ(engram.pipeline_depth, 2);
+    EXPECT_GT((98304ULL * 264 + engram.chunk_bytes - 1) / engram.chunk_bytes,
+              engram.pipeline_depth);
+}
+
 #ifdef USE_TENT
 class ScopedUnsetEnvVar {
    public:

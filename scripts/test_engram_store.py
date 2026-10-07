@@ -29,10 +29,10 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = os.environ.get("MOONCAKE_BUILD_DIR", "build")
 BUILD_STORE = REPO_ROOT / BUILD_DIR / "mooncake-integration"
-WHEEL_DIR = REPO_ROOT / "mooncake-wheel"
+PYTHON_DIR = REPO_ROOT / "python"
 MASTER_BINARY = REPO_ROOT / BUILD_DIR / "mooncake-store" / "src" / "mooncake_master"
 
-for path in (BUILD_STORE, WHEEL_DIR):
+for path in (BUILD_STORE, PYTHON_DIR):
     if path.is_dir() and str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -276,12 +276,16 @@ class EngramStoreTestBase(unittest.TestCase):
         cfg = self.create_config()
         self.layer_id = layer_id
         if store_marker is Ellipsis:
-            engram_store = self.EngramStore(layers={layer_id: cfg}, store=self.store)
+            engram_store = self.EngramStore(
+                layers={layer_id: cfg}, store_client=self.store
+            )
             self._created_engram_stores.append(engram_store)
         elif store_marker is None:
             engram_store = self.EngramStore(layers={layer_id: cfg})
         else:
-            engram_store = self.EngramStore(layers={layer_id: cfg}, store=store_marker)
+            engram_store = self.EngramStore(
+                layers={layer_id: cfg}, store_client=store_marker
+            )
             self._created_engram_stores.append(engram_store)
         return cfg, engram_store
 
@@ -330,7 +334,9 @@ class TestEngramStoreMetadata(EngramStoreTestBase):
 
         cfg = self.create_config()
         cfg.row_bytes = 264
-        table = self.EngramStore({1: cfg, 14: cfg})
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        table = self.EngramStore({1: cfg, 14: cfg}, local_dir=directory.name)
         arrays = [
             np.arange(n * 264, dtype=np.uint32).astype(np.uint8).reshape(n, 264)
             for n in cfg.table_vocab_sizes
@@ -339,10 +345,10 @@ class TestEngramStoreMetadata(EngramStoreTestBase):
         refs = [weakref.ref(a) for a in arrays]
         for a in arrays:
             a.flags.writeable = False
-        table.bind_local(1, arrays)
+        table.populate(1, arrays)
         del arrays, a
         gc.collect()
-        assert all(ref() is not None for ref in refs)
+        assert all(ref() is None for ref in refs)
         ids = (np.array(cfg.table_vocab_sizes, dtype=np.int64) - 1)[None, None]
         output = np.empty((1, 1, len(cfg.table_vocab_sizes), 264), dtype=np.uint8)
         table.lookup_into(1, ids, output)  # No Store or registered output.
@@ -488,6 +494,57 @@ class TestErrorHandling(EngramStoreTestBase):
 
 
 class TestByteRows(EngramStoreTestBase):
+    def test_packed_lookup_preserves_holes_and_validates_before_writing(self):
+        """One registered allocation; skipped and invalid IDs must not corrupt it."""
+        cfg = self.EngramStoreConfig()
+        cfg.table_vocab_sizes, cfg.row_bytes = [17], 264
+        keys = [self._next_layer_id, self._next_layer_id + 1]
+        table = self.EngramStore(dict.fromkeys(keys, cfg), store_client=self.store)
+        self._created_engram_stores.append(table)
+        sources = [
+            (np.arange(17 * 264).reshape(17, 264) + h).astype(np.uint8)
+            for h in range(2)
+        ]
+        for key, source in zip(keys, sources):
+            table.populate(key, [source])
+        self.layer_id = keys[0]
+        with self.registered_output(table, (2, 9)) as allocation:
+            for tokens in (9, 1, 5):
+                ids = np.tile(np.arange(tokens, dtype=np.int64), (2, 1))
+                ids[:, ::3] = -1
+                output = allocation.reshape(-1)[: 2 * tokens * 264].reshape(
+                    2, tokens, 264
+                )
+                allocation.fill(253)
+                table.lookup(keys, ids, output)
+                for head in range(2):
+                    live = ids[head] != -1
+                    np.testing.assert_array_equal(
+                        output[head, live], sources[head][ids[head, live]]
+                    )
+                    self.assertTrue(np.all(output[head, ~live] == 253))
+                self.assertTrue(
+                    np.all(allocation.reshape(-1)[2 * tokens * 264 :] == 253)
+                )
+            for invalid in (-2, 17):
+                ids = np.array([[0], [invalid]], dtype=np.int64)
+                output = allocation.reshape(-1)[: 2 * 264].reshape(2, 1, 264)
+                allocation.fill(253)
+                with self.assertRaises(RuntimeError):
+                    table.lookup(keys, ids, output)
+                self.assertTrue(np.all(allocation == 253))
+            with self.assertRaises(ValueError):
+                table.lookup(keys, ids.astype(np.int32), output)
+            with self.assertRaises(ValueError):
+                table.lookup(keys, ids, output[..., :-1])
+            with self.assertRaises(ValueError):
+                table.lookup(keys, ids, output[..., ::-1])
+            table.lookup(
+                keys,
+                np.empty((2, 0), dtype=np.int64),
+                np.empty((2, 0, 264), dtype=np.uint8),
+            )
+
     def create_config(self):
         cfg = super().create_config()
         cfg.row_bytes = 264

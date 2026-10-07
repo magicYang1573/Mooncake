@@ -204,6 +204,9 @@ class Client {
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
 
+    void SetScatterStagingAllocator(
+        TransferEngine::ScatterStagingAllocator allocator);
+
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
