@@ -155,6 +155,10 @@ if(WITH_STORE)
     store/engram_store_py.cpp
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
+  if(USE_CUDA)
+    target_compile_definitions(store PRIVATE MOONCAKE_ENGRAM_CUDA)
+    target_link_libraries(store PRIVATE CUDA::cudart)
+  endif()
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
@@ -269,13 +273,12 @@ if(WITH_TE)
   install(TARGETS engine asio_shared
           LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   # Co-locate libtent_metrics.so with the python C extensions so engine.so and
-  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton must
+  # be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
-            COMPONENT python)
+            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 endif()
 

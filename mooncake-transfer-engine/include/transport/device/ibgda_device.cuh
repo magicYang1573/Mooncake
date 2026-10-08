@@ -1,6 +1,6 @@
 // IBGDA device context and operations.
 //
-// Wraps mlx5gda_qp_devctx and issues RDMA writes/atomics via
+// Wraps mlx5gda_qp_devctx and issues RDMA reads/writes/atomics via
 // device-side WQE construction.
 //
 // WQE construction and CQ polling are shared across CUDA, MUSA and MACA.
@@ -129,18 +129,20 @@ __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
     }
 }
 
-// Issue an RDMA WRITE WQE.  laddr/raddr are device VAs; keys are big-endian.
-__device__ __forceinline__ void mc_ibgda_write_rdma_write_wqe(
+// Build an RDMA WQE without publishing it. Addresses are registered virtual
+// addresses; the remote address may refer to host memory. Keys are big-endian.
+// The caller owns the QP lock and must reserve space before writing the WQE.
+__device__ __forceinline__ void mc_ibgda_write_rdma_wqe(
     mlx5gda_qp_devctx* qp, uint64_t laddr, __be32 lkey, uint64_t raddr,
-    __be32 rkey, uint32_t bytes) {
+    __be32 rkey, uint32_t bytes, uint8_t opcode) {
     auto* wqe = reinterpret_cast<mlx5gda_rdma_write_wqe*>(
         qp->wq + (qp->wq_head & qp->wqeid_mask));
 
     wqe->ctrl = {};
     wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 3);
     wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    wqe->ctrl.opmod_idx_opcode = mc_bswap32(
-        (static_cast<uint32_t>(qp->wq_head) << 8) | MLX5_OPCODE_RDMA_WRITE);
+    wqe->ctrl.opmod_idx_opcode =
+        mc_bswap32((static_cast<uint32_t>(qp->wq_head) << 8) | opcode);
 
     wqe->raddr.raddr = mc_bswap64(raddr);
     wqe->raddr.rkey = rkey;
@@ -151,6 +153,22 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_write_wqe(
     wqe->data.addr = mc_bswap64(laddr);
 
     ++qp->wq_head;
+}
+
+__device__ __forceinline__ void mc_ibgda_write_rdma_write_wqe(
+    mlx5gda_qp_devctx* qp, uint64_t laddr, __be32 lkey, uint64_t raddr,
+    __be32 rkey, uint32_t bytes) {
+    mc_ibgda_write_rdma_wqe(qp, laddr, lkey, raddr, rkey, bytes,
+                            MLX5_OPCODE_RDMA_WRITE);
+}
+
+// READ into laddr from raddr. Completion and inbound GPU-memory visibility
+// must be established before the destination is consumed or reused.
+__device__ __forceinline__ void mc_ibgda_write_rdma_read_wqe(
+    mlx5gda_qp_devctx* qp, uint64_t laddr, __be32 lkey, uint64_t raddr,
+    __be32 rkey, uint32_t bytes) {
+    mc_ibgda_write_rdma_wqe(qp, laddr, lkey, raddr, rkey, bytes,
+                            MLX5_OPCODE_RDMA_READ);
 }
 
 // Issue an RDMA ATOMIC MASKED FETCH-AND-ADD WQE (32-bit add_data).

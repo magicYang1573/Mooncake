@@ -16,6 +16,9 @@ class PyClient;
 
 namespace engram {
 
+class GpuLookup;
+class GpuLookupContext;
+
 /**
  * Mooncake backend for all layers of a model's Engram embedding tables.
  *
@@ -78,6 +81,18 @@ class EngramStore {
     int lookup(const std::vector<int>& table_ids, const int64_t* row_ids,
                size_t tokens, void* output, size_t output_size) const;
 
+    // CUDA overload: IDs are strided [tokens, heads], output is head-major.
+    // Enqueues a graph-capturable request. Call GpuLookup::wait on the consumer
+    // stream before accessing output. Keep tensors and this store alive until
+    // all streams/graphs using them have finished. Warm up before capture.
+    std::shared_ptr<GpuLookup> lookup_cuda(const std::vector<int>& table_ids,
+                                           const void* ids, bool ids_int64,
+                                           size_t tokens, size_t token_stride,
+                                           size_t head_stride,
+                                           const std::vector<int64_t>& offsets,
+                                           void* output, size_t bytes,
+                                           uintptr_t stream);
+
     std::vector<int> get_layer_ids() const;
     std::vector<int64_t> get_table_vocab_sizes(int layer_id) const;
     std::vector<std::string> get_store_keys(int layer_id) const;
@@ -124,6 +139,8 @@ class EngramStore {
     mutable std::mutex query_cache_mutex_;
     mutable std::map<int, std::shared_ptr<QueryCacheEntry>> query_cache_;
     mutable std::shared_ptr<QueryCacheEntry> multi_layer_query_cache_;
+    std::once_flag gpu_lookup_init_;
+    std::shared_ptr<GpuLookupContext> gpu_lookup_;
 };
 
 }  // namespace engram

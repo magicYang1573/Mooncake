@@ -94,11 +94,25 @@ static int map_uar_for_device(struct mlx5dv_devx_uar* uar,
     const cudaError_t register_result =
         cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
                          cudaHostRegisterMapped | cudaHostRegisterIoMemory);
+#if defined(USE_CUDA)
+    if (register_result != cudaSuccess &&
+        register_result != cudaErrorHostMemoryAlreadyRegistered) {
+        fprintf(stderr,
+                "Failed to register BF MMIO page for GPU access: %s (%d). "
+                "GPU-initiated RDMA requires permission to map NIC MMIO.\n",
+                cudaGetErrorString(register_result),
+                static_cast<int>(register_result));
+        errno = register_result == cudaErrorNotPermitted ? EPERM : EIO;
+        return -1;
+    }
+#endif
     void* device_base = nullptr;
-    if (cudaHostGetDevicePointer(&device_base, uar->reg_addr, 0) !=
-        cudaSuccess) {
+    const cudaError_t map_result =
+        cudaHostGetDevicePointer(&device_base, uar->reg_addr, 0);
+    if (map_result != cudaSuccess) {
         if (register_result == cudaSuccess) cudaHostUnregister(uar->reg_addr);
-        print_cuda_error("Failed to map BF MMIO page");
+        fprintf(stderr, "Failed to map BF MMIO page: %s (%d)\n",
+                cudaGetErrorString(map_result), static_cast<int>(map_result));
         errno = EIO;
         return -1;
     }

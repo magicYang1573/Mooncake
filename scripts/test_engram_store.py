@@ -164,8 +164,8 @@ def start_local_master():
         metadata_server=metadata_url,
         global_segment_size=128 * 1024 * 1024,
         local_buffer_size=64 * 1024 * 1024,
-        protocol="tcp",
-        device_name="",
+        protocol=os.getenv("MOONCAKE_TEST_PROTOCOL", "tcp"),
+        device_name=os.getenv("MOONCAKE_TEST_DEVICE", ""),
         master_server_address=f"127.0.0.1:{rpc_port}",
     )
 
@@ -494,6 +494,112 @@ class TestErrorHandling(EngramStoreTestBase):
 
 
 class TestByteRows(EngramStoreTestBase):
+    def test_cuda_lookup_replays_new_ids_and_reuses_output_capacity(self):
+        """GPU submission must execute on every replay, including new shapes."""
+        if TEST_CONFIG.protocol != "rdma" or not hasattr(STORE_MODULE, "EngramLookup"):
+            self.skipTest("requires a CUDA build and RDMA test connection")
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("requires a CUDA GPU")
+        cfg = self.EngramStoreConfig()
+        cfg.table_vocab_sizes, cfg.row_bytes = [17], 264
+        keys = [self._next_layer_id, self._next_layer_id + 1]
+        table = self.EngramStore(dict.fromkeys(keys, cfg), store_client=self.store)
+        self._created_engram_stores.append(table)
+        sources = [
+            (np.arange(17 * 264).reshape(17, 264) + h).astype(np.uint8)
+            for h in range(2)
+        ]
+        for key, source in zip(keys, sources):
+            table.populate(key, [source])
+        allocation = torch.empty(2 * 12 * 264, dtype=torch.uint8, device="cuda")
+        self.assertEqual(
+            self.store.register_buffer(allocation.data_ptr(), allocation.numel()), 0
+        )
+        graph = None
+        try:
+            for dtype in (torch.int32, torch.int64):
+                for tokens in (1, 9, 0, 5):
+                    ids = torch.zeros((tokens, 4), dtype=dtype, device="cuda")
+                    ids[:, 2] = 17
+                    output = allocation[: 2 * tokens * 264].view(2, tokens, 264)
+
+                    def read():
+                        stream = torch.cuda.current_stream().cuda_stream
+                        request = table.lookup(
+                            keys, ids[:, 1:3], output, stream=stream, offsets=[0, 17]
+                        )
+                        request.wait(stream)
+                        return request
+
+                    # One capacity warmup also covers later shapes/dtypes.
+                    if dtype == torch.int32 and tokens == 1:
+                        request = read()
+                        torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        request = read()
+                    for replay in range(3):
+                        local = np.full((tokens, 2), replay + 1, dtype=np.int64)
+                        local[::3] = -1
+                        if replay == 2:
+                            local.fill(-1)
+                        global_ids = np.where(local == -1, -1, local + [0, 17])
+                        ids[:, 1:3].copy_(
+                            torch.as_tensor(global_ids, dtype=dtype, device="cuda")
+                        )
+                        allocation.fill_(253)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        request.check()
+                        actual = output.cpu().numpy()
+                        for head in range(2):
+                            live = local[:, head] != -1
+                            np.testing.assert_array_equal(
+                                actual[head, live], sources[head][local[live, head]]
+                            )
+                            self.assertTrue(np.all(actual[head, ~live] == 253))
+                        self.assertTrue(
+                            bool((allocation[2 * tokens * 264 :] == 253).all())
+                        )
+                    del graph
+                    graph = None
+            producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+            producer_graph, consumer_graph = (
+                torch.cuda.CUDAGraph(),
+                torch.cuda.CUDAGraph(),
+            )
+            with torch.cuda.graph(producer_graph, stream=producer):
+                request = table.lookup(
+                    keys,
+                    ids[:, 1:3],
+                    output,
+                    stream=producer.cuda_stream,
+                    offsets=[0, 17],
+                )
+            with torch.cuda.graph(consumer_graph, stream=consumer):
+                request.wait(consumer.cuda_stream)
+            for row in (2, 7, 11):
+                ids[:, 1] = row
+                ids[:, 2] = row + 17
+                torch.cuda.synchronize()
+                with torch.cuda.stream(producer):
+                    producer_graph.replay()
+                with torch.cuda.stream(consumer):
+                    consumer_graph.replay()
+                torch.cuda.synchronize()
+                for head in range(2):
+                    np.testing.assert_array_equal(
+                        output[head].cpu().numpy(),
+                        np.tile(sources[head][row], (tokens, 1)),
+                    )
+            del producer_graph, consumer_graph
+        finally:
+            torch.cuda.synchronize()
+            del graph
+            self.store.unregister_buffer(allocation.data_ptr())
+
     def test_packed_lookup_preserves_holes_and_validates_before_writing(self):
         """One registered allocation; skipped and invalid IDs must not corrupt it."""
         cfg = self.EngramStoreConfig()

@@ -8,6 +8,9 @@
 #include "engram/engram_store.h"
 #include "engram/engram_store_config.h"
 #include "pyclient.h"
+#ifdef MOONCAKE_ENGRAM_CUDA
+#include "engram/gpu_lookup.h"
+#endif
 
 namespace py = pybind11;
 using namespace mooncake;
@@ -95,6 +98,13 @@ namespace mooncake {
 namespace engram {
 
 void bind_engram_store(py::module& m) {
+#ifdef MOONCAKE_ENGRAM_CUDA
+    py::class_<GpuLookup, std::shared_ptr<GpuLookup>>(m, "EngramLookup")
+        .def("wait", &GpuLookup::wait, py::arg("stream"),
+             "Enqueue completion and visibility on the consumer CUDA stream.")
+        .def("check", &GpuLookup::check,
+             "Check asynchronous errors after synchronizing the CUDA stream.");
+#endif
     py::class_<EngramStoreConfig>(m, "EngramStoreConfig")
         .def(py::init<>())
         .def_readwrite("table_vocab_sizes",
@@ -129,6 +139,67 @@ void bind_engram_store(py::module& m) {
              }),
              py::arg("layers"), py::arg("store_client") = py::none(),
              py::arg("local_dir") = "")
+#ifdef MOONCAKE_ENGRAM_CUDA
+        .def(
+            "lookup",
+            [](EngramStore& self, const std::vector<int>& tables,
+               py::object ids, py::object output, uintptr_t stream,
+               std::vector<int64_t> offsets) {
+                if (!ids.attr("is_cuda").cast<bool>() ||
+                    !output.attr("is_cuda").cast<bool>() ||
+                    !ids.attr("device").equal(output.attr("device")))
+                    throw std::invalid_argument(
+                        "lookup tensors must be on the same CUDA device");
+                int device;
+                if (cudaGetDevice(&device) != cudaSuccess ||
+                    device != ids.attr("device").attr("index").cast<int>())
+                    throw std::invalid_argument(
+                        "lookup requires the current CUDA device");
+                auto shape = ids.attr("shape").cast<std::vector<size_t>>();
+                const auto dtype =
+                    py::str(ids.attr("dtype")).cast<std::string>();
+                if (shape.size() != 2 || shape[1] != tables.size() ||
+                    tables.empty() ||
+                    (dtype != "torch.int32" && dtype != "torch.int64"))
+                    throw std::invalid_argument(
+                        "CUDA IDs must be int32/int64 [tokens,heads]");
+                const auto strides =
+                    ids.attr("stride")().cast<std::vector<size_t>>();
+                const auto width = self.get_row_bytes(tables.front());
+                if (py::str(output.attr("dtype")).cast<std::string>() !=
+                        "torch.uint8" ||
+                    !output.attr("is_contiguous")().cast<bool>() ||
+                    output.attr("shape").cast<std::vector<size_t>>() !=
+                        std::vector<size_t>{tables.size(), shape[0],
+                                            static_cast<size_t>(width)})
+                    throw std::invalid_argument(
+                        "output must be contiguous uint8 "
+                        "[heads,tokens,row_bytes]");
+                if (offsets.empty()) offsets.resize(tables.size(), 0);
+                auto storage = output.attr("untyped_storage")();
+                const auto base = storage.attr("data_ptr")().cast<uintptr_t>();
+                const auto capacity = storage.attr("nbytes")().cast<size_t>();
+                const auto address =
+                    shape[0]
+                        ? output.attr("data_ptr")().cast<uintptr_t>()
+                        : base + output.attr("storage_offset")().cast<size_t>();
+                if (address < base || address - base > capacity)
+                    throw std::invalid_argument("Invalid output storage range");
+                return self.lookup_cuda(
+                    tables,
+                    reinterpret_cast<void*>(
+                        ids.attr("data_ptr")().cast<uintptr_t>()),
+                    dtype == "torch.int64", shape[0], strides[0], strides[1],
+                    offsets, reinterpret_cast<void*>(address),
+                    capacity - (address - base), stream);
+            },
+            py::arg("table_ids"), py::arg("row_ids"), py::arg("output"),
+            py::kw_only(), py::arg("stream"),
+            py::arg("offsets") = std::vector<int64_t>{}, py::keep_alive<0, 1>(),
+            "Enqueue GPU IDs on stream and return a lookup handle. The caller "
+            "must keep tensors alive, register output, warm up before graph "
+            "capture, and wait on the handle before reading/reusing output.")
+#endif
         .def(
             "lookup",
             [](EngramStore& self, const std::vector<int>& table_ids,
