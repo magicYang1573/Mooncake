@@ -53,8 +53,15 @@ def finish(
     b = tl.arange(0, B)
     mapped = tl.load(MAPPED + row)
     live = mapped >= 0
-    local = live & (mapped // slot == shard)
-    a = tl.load(LOCAL + (mapped % slot) * stride + b, local & (b < width), 0)
+    mapped_offset = mapped.to(tl.int64)
+    local = live & (mapped_offset // slot == shard)
+    # The logical row index fits in int32, but large Engram tables can have a
+    # byte offset above 2 GiB. Promote before multiplying by the row stride.
+    a = tl.load(
+        LOCAL + (mapped_offset % slot) * stride + b,
+        local & (b < width),
+        0,
+    )
     r = tl.load(FETCHED + row * stride + b, live & ~local & (b < width), 0)
     tl.store(
         OUT + row // heads * o0 + row % heads * o1 + b,
